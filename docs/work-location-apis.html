@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Work Location APIs — flowcharts</title>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark", securityLevel: "loose", flowchart: { curve: "basis", htmlLabels: true } });
+  </script>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, sans-serif; background: #111; color: #e8e6e3; }
+    header { padding: 28px 24px 8px; max-width: 980px; margin: 0 auto; }
+    header a { color: #8cb4ff; text-decoration: none; font-size: 13px; }
+    h1 { font-size: 28px; font-weight: 600; margin: 8px 0; }
+    .sub { color: #b3aea6; line-height: 1.55; max-width: 72ch; }
+    nav { display: flex; flex-wrap: wrap; gap: 8px; max-width: 980px; margin: 20px auto; padding: 0 24px; }
+    nav a { font-size: 12px; padding: 4px 8px; background: #1c1c1c; border: 1px solid #2d2d2d; color: #d6d2cc; text-decoration: none; }
+    nav a:hover { border-color: #4a6fa5; }
+    .method { font-weight: 700; margin-right: 6px; }
+    GET { } 
+    article { max-width: 980px; margin: 0 auto 48px; padding: 0 24px; }
+    article h2 { font-size: 18px; margin: 0 0 6px; }
+    .path { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: #c9c4bb; word-break: break-all; }
+    .pill { display: inline-block; font-size: 11px; padding: 2px 7px; margin-right: 6px; background: #243044; color: #c5d4f0; }
+    .notes { color: #b3aea6; font-size: 14px; line-height: 1.5; padding-left: 18px; }
+    .mermaid { background: #161616; border: 1px solid #2a2a2a; padding: 16px; overflow-x: auto; margin: 16px 0; }
+    footer { max-width: 980px; margin: 0 auto 48px; padding: 0 24px; color: #7a756e; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="./">← idea-brain-storm</a>
+    <h1>Work Location APIs</h1>
+    <p class="sub">
+      Sixteen REST endpoints in the policies-web-services <code>workLocation</code> module.
+      Flows are traced from the controller through AuthZ, data-accuracy, the Sync SDK vs DAL-write fork, IOP, and PWS (<code>wlc</code> schema).
+    </p>
+    <p class="sub">
+      <strong>Shared write fork:</strong> location and V2 assignment writes go through
+      <code>WorkLocationIopV2DalWriteHelper</code> — feature flag
+      <code>SWITCH_TO_V2_FOR_WORK_LOCATION_DAL_WRITE</code> (or the employee-assignment sibling),
+      skip-version-bump header, and IOP sync-in-progress guard (HTTP 307).
+      Legacy path: Sync SDK (IOP REST, then PWS commit). DAL-write path: validate → IOP V2 Hibernate → PWS;
+      PWS failure after IOP success resets the data duality tracker.
+      V3 additional assignments use commit-PWS-then-notify-IOP.
+    </p>
+  </header>
+
+  <nav>
+    <a href="#get-wl"><span class="method">GET</span> locations</a>
+    <a href="#post-wl"><span class="method">POST</span> create</a>
+    <a href="#patch-wl"><span class="method">PATCH</span> update</a>
+    <a href="#delete-wl"><span class="method">DELETE</span> location</a>
+    <a href="#psd"><span class="method">POST</span> PSD</a>
+    <a href="#primary"><span class="method">PATCH</span> primary</a>
+    <a href="#get-ee-v2"><span class="method">GET</span> v2 assign</a>
+    <a href="#patch-ee-v2"><span class="method">PATCH</span> v2 EE</a>
+    <a href="#batch-ee-v2"><span class="method">PATCH</span> v2 batch</a>
+    <a href="#v3-assign"><span class="method">POST</span> v3 assign</a>
+    <a href="#v3-bulk-assign"><span class="method">POST</span> v3 bulk</a>
+    <a href="#v3-bulk-unassign"><span class="method">DELETE</span> v3 unassign</a>
+    <a href="#v3-update"><span class="method">PATCH</span> v3 additional</a>
+    <a href="#v3-remove"><span class="method">DELETE</span> v3 additional</a>
+    <a href="#v3-get"><span class="method">GET</span> v3 assign</a>
+    <a href="#v3-employees"><span class="method">GET</span> employees</a>
+  </nav>
+
+  <article id="get-wl">
+    <span class="pill">GET</span><span class="pill">WorkLocationController</span><span class="pill">employer:workLocation read</span>
+    <h2>List work locations</h2>
+    <p class="path">GET /v2/company/{accountId}/policies/work_locations</p>
+    <div class="mermaid">
+flowchart TD
+  A[GET work_locations] --> B{IOP sync in progress?}
+  B -->|yes| C[307 Temporary Redirect]
+  B -->|no| D["@Secured read + data accuracy"]
+  D --> E{CNC internal reads FF?}
+  E -->|on| F[WorkLocationInternalService]
+  E -->|off| G[findByCompanyAccountId]
+  G --> H[Load company primary WL]
+  H -->|missing| I[Return empty list]
+  H -->|found| J[Build PSD name map]
+  J --> K[Map DAO to WorkLocationDTO]
+  F --> L[Result.data = list]
+  K --> L
+    </div>
+    <ul class="notes">
+      <li>ENABLE_CNC_INTERNAL_WORK_LOCATION_READS routes to WorkLocationInternalServiceImpl.</li>
+      <li>No locations or no company_primary_work_location row returns an empty list.</li>
+    </ul>
+  </article>
+
+  <article id="post-wl">
+    <span class="pill">POST</span><span class="pill">WorkLocationController</span><span class="pill">create</span>
+    <h2>Create work location</h2>
+    <p class="path">POST /v2/company/{accountId}/policies/work_locations</p>
+    <div class="mermaid">
+flowchart TD
+  A[POST CreateWorkLocationDTO] --> B{DAL-write eligible?}
+  B -->|FF + header| C[Synchronous data accuracy]
+  C --> D[CreationValidator]
+  D --> E[IOP V2 Hibernate create]
+  E --> F[Save PWS + primary if needed]
+  F -->|ok| G[Upstream version]
+  F -->|fail| H[Reset DDT and fail]
+  G --> I[Result WorkLocationDTO]
+  B -->|legacy| J[CreateWorkLocation workflow]
+  J --> K[IOP REST create]
+  K --> L[PWS commit activity]
+  L -->|ok| I
+  L -->|PWS fail| M[Return IOP DTO]
+    </div>
+    <ul class="notes">
+      <li>RoamingValidator blocks unsupported-state company locations.</li>
+      <li>Legacy: if IOP succeeds and PWS fails, the API returns the IOP DTO.</li>
+    </ul>
+  </article>
+
+  <article id="patch-wl">
+    <span class="pill">PATCH</span><span class="pill">WorkLocationController</span><span class="pill">update</span>
+    <h2>Update work location</h2>
+    <p class="path">PATCH /v2/company/{accountId}/policies/work_locations/{worklocationId}</p>
+    <div class="mermaid">
+flowchart TD
+  A[PATCH UpdateWorkLocationDTO] --> B{DAL-write eligible?}
+  B -->|yes| C[Synchronous data accuracy]
+  C --> D[UpdateValidator + roaming]
+  D --> E[IOP V2 update]
+  E --> F[PWS save / primary swap]
+  F --> Z[Result WorkLocationDTO]
+  B -->|no| G[UpdateWorkLocation workflow]
+  G --> H[Load existing DAO]
+  H --> I{Fields changed?}
+  I -->|yes| J[Save + changelog]
+  I -->|no| K[Skip save]
+  J --> Z
+  K --> Z
+    </div>
+    <ul class="notes">
+      <li>Rejects update if the location is missing in PWS.</li>
+      <li>Roaming inactivation is blocked when active employees (including additional assignments) remain.</li>
+    </ul>
+  </article>
+
+  <article id="delete-wl">
+    <span class="pill">DELETE</span><span class="pill">WorkLocationController</span><span class="pill">delete</span>
+    <h2>Delete work location</h2>
+    <p class="path">DELETE /v2/company/{accountId}/policies/work_locations/{worklocationId}</p>
+    <div class="mermaid">
+flowchart TD
+  A[DELETE worklocationId] --> B{DAL-write eligible?}
+  B -->|yes| C[Synchronous data accuracy]
+  C --> D[DeletionValidator]
+  D --> E[IOP V2 delete]
+  E --> F[PWS delete + map DTO]
+  F --> Z[Result]
+  B -->|no| G[DeleteWorkLocation workflow]
+  G --> Z
+    </div>
+    <ul class="notes">
+      <li>Deletion validator is feature-flag gated and blocks in-use locations.</li>
+    </ul>
+  </article>
+
+  <article id="psd">
+    <span class="pill">POST</span><span class="pill">WorkLocationController</span><span class="pill">read</span>
+    <h2>Political subdivision codes</h2>
+    <p class="path">POST /v2/company/{accountId}/policies/work_locations/political_subdivision_codes</p>
+    <div class="mermaid">
+flowchart TD
+  A[POST address on WorkLocationDTO] --> B{Input valid?}
+  B -->|no| C[RuntimeException]
+  B -->|yes| D[IOP getPsdCodesInIOP]
+  D --> E[PWS getPsdCodesFromValidatedAddress]
+  E --> F{IOP vs PWS match?}
+  F -->|match| G[Return PWS PSD list]
+  F -->|differ| H[Return IOP and log mismatch]
+    </div>
+    <ul class="notes">
+      <li>Pennsylvania addresses. If both sides error and codes match, throws UserException (400).</li>
+      <li>IOP success / PWS failure still returns IOP data.</li>
+    </ul>
+  </article>
+
+  <article id="primary">
+    <span class="pill">PATCH</span><span class="pill">CompanyPrimaryWorkLocationController</span><span class="pill">update</span>
+    <h2>Company primary work location</h2>
+    <p class="path">PATCH /v2/company/{accountId}/policies/work_locations/primary</p>
+    <div class="mermaid">
+flowchart TD
+  A[PATCH primary request] --> B[CompanyPrimaryWorkLocationValidator]
+  B --> C{Existing primary row?}
+  C -->|no| D[UserValidationException]
+  C -->|yes| E[syncCompanyPrimaryWorkLocationInIOP]
+  E --> F[Save PWS + upstream version]
+  F -->|ok| G[CompanyPrimaryWorkLocationDTO]
+  F -->|PWS fail| H[Reset DDT; return DTO anyway]
+    </div>
+    <ul class="notes">
+      <li>Always DAL-write: IOP first, then PWS. AuthZ lives on the IOPV2 sync service, not the thin controller.</li>
+    </ul>
+  </article>
+
+  <article id="get-ee-v2">
+    <span class="pill">GET</span><span class="pill">EmployeeWorkLocationAssignmentController</span>
+    <h2>V2 list employee assignments</h2>
+    <p class="path">GET /v2/company/{account_id}/policies/work_locations/employee_assignments</p>
+    <div class="mermaid">
+flowchart TD
+  A[GET employee_assignments] --> B{Sync in progress?}
+  B -->|yes| C[307]
+  B -->|no| D[Parse employeeIds CSV]
+  D --> E{Single-EE AuthZ FF?}
+  E -->|exactly 1 EE| F[getEmployeeWorkLocationAssignment]
+  E -->|0 or N EEs| G[getAllEmployeeWorkLocationAssignments]
+  F --> H[Result list]
+  G --> H
+    </div>
+    <ul class="notes">
+      <li>Single employee can use employee-scoped AuthZ; bulk is employer-only.</li>
+    </ul>
+  </article>
+
+  <article id="patch-ee-v2">
+    <span class="pill">PATCH</span><span class="pill">EmployeeWorkLocationAssignmentController</span>
+    <h2>V2 update primary assignment</h2>
+    <p class="path">PATCH /v2/company/{account_id}/policies/work_locations/employee_assignments/{employee_id}</p>
+    <div class="mermaid">
+flowchart TD
+  A["PATCH body = workLocationId"] --> B{Employee DAL-write eligible?}
+  B -->|yes| C[AssignmentUpdateValidator]
+  C --> D[Resolve internal EE + WL ids]
+  D --> E[IOP V2 assignment sync]
+  E --> F[Roaming promotion cleanup]
+  F --> G[PWS persist assignment]
+  G --> Z[EmployeeWorkLocationAssignmentDTO]
+  B -->|no| H[Update EE assignment workflow]
+  H --> Z
+    </div>
+    <ul class="notes">
+      <li>DAL path strips quotes from the body workLocationId.</li>
+    </ul>
+  </article>
+
+  <article id="batch-ee-v2">
+    <span class="pill">PATCH</span><span class="pill">EmployeeWorkLocationAssignmentController</span>
+    <h2>V2 batch primary assignment</h2>
+    <p class="path">PATCH /v2/company/{account_id}/policies/work_locations/employee_assignments</p>
+    <div class="mermaid">
+flowchart TD
+  A[PATCH BatchInputDTO] --> B[EnforceDataAccuracy write]
+  B --> C[Batch update sync workflow]
+  C --> D[IOP batch assignment]
+  D --> E[PWS batch persist]
+  E --> F["Result data + errors"]
+    </div>
+    <ul class="notes">
+      <li>Always Sync SDK. Partial success: Result.data plus Result.errors.</li>
+    </ul>
+  </article>
+
+  <article id="v3-assign">
+    <span class="pill">POST</span><span class="pill">WorkLocationAssignmentV3Controller</span>
+    <h2>V3 assign (primary or additional)</h2>
+    <p class="path">POST /v3/company/{account_id}/policies/work_locations/employee_assignments/{employee_id}</p>
+    <div class="mermaid">
+flowchart TD
+  A[POST AssignAdditionalWorkLocationDTO] --> B{employee_id present?}
+  B -->|no| C[IllegalArgumentException]
+  B -->|yes| D{isPrimary?}
+  D -->|primary| E[QBO to external employee id]
+  E --> F[V2 updateEmployeeWorkLocationAssignment]
+  F --> Z[EmployeeWorkLocationAssignmentV3DTO]
+  D -->|additional| G[assignAdditionalWorkLocations]
+  G -->|fail| H[Throw first failure]
+  G -->|ok| Z
+    </div>
+    <ul class="notes">
+      <li>employee_id is a QBO id. Additional path: persist then durability strategy notifies IOP.</li>
+    </ul>
+  </article>
+
+  <article id="v3-bulk-assign">
+    <span class="pill">POST</span><span class="pill">WorkLocationAssignmentV3Controller</span>
+    <h2>V3 bulk assign</h2>
+    <p class="path">POST /v3/company/{account_id}/policies/work_locations/employee_assignments/bulk_assign</p>
+    <div class="mermaid">
+flowchart TD
+  A[POST BulkAssignWorkLocationsRequestDTO] --> B[Validate and dedupe employee IDs]
+  B --> C{isPrimary?}
+  C -->|primary| D[Resolve QBO to external map]
+  D --> E[V2 batch primary workflow]
+  E --> Z["Result list + BatchError"]
+  C -->|additional| F[bulkAssign additional + IOP notify]
+  F --> Z
+    </div>
+    <ul class="notes">
+      <li>Unmapped QBO IDs become BatchError and are not forwarded to V2.</li>
+    </ul>
+  </article>
+
+  <article id="v3-bulk-unassign">
+    <span class="pill">DELETE</span><span class="pill">WorkLocationAssignmentV3Controller</span>
+    <h2>V3 bulk unassign</h2>
+    <p class="path">DELETE /v3/company/{account_id}/policies/work_locations/employee_assignments/bulk_unassign</p>
+    <div class="mermaid">
+flowchart TD
+  A[DELETE bulk_unassign] --> B{isPrimary true?}
+  B -->|yes| C[400 PrimaryUnassignNotSupported]
+  B -->|no| D[unassignAdditionalWorkLocations]
+  D --> E["Result list + errors"]
+    </div>
+    <ul class="notes">
+      <li>Every employee must keep a primary assignment.</li>
+    </ul>
+  </article>
+
+  <article id="v3-update">
+    <span class="pill">PATCH</span><span class="pill">WorkLocationAssignmentV3Controller</span>
+    <h2>V3 update additional assignment</h2>
+    <p class="path">PATCH /v3/company/{account_id}/policies/work_locations/employee_assignments/{employee_id}</p>
+    <div class="mermaid">
+flowchart TD
+  A[PATCH UpdateAdditionalWorkLocationDTO] --> B[Txn: validate + save]
+  B --> C{Assignment owned by employee?}
+  C -->|no| E[UserException]
+  C -->|yes| D{Already primary or duplicate?}
+  D -->|yes| E
+  D -->|no| F[Update row + record IOP intent]
+  F --> G[Post-commit IOP reconcile]
+  G --> Z[V3 DTO]
+    </div>
+    <ul class="notes">
+      <li>saveUpdatedAdditionalAssignment is transactional via a lazy self proxy so IOP runs after commit.</li>
+    </ul>
+  </article>
+
+  <article id="v3-remove">
+    <span class="pill">DELETE</span><span class="pill">WorkLocationAssignmentV3Controller</span>
+    <h2>V3 remove additional assignment</h2>
+    <p class="path">DELETE /v3/company/{account_id}/policies/work_locations/employee_assignments/{employee_id}</p>
+    <div class="mermaid">
+flowchart TD
+  A[DELETE assignment id in body] --> B[Resolve assignment to EE + WL]
+  B --> C{Found and owned?}
+  C -->|no| D[UserException]
+  C -->|yes| E["unassignAdditionalWorkLocations (1)"]
+  E --> Z[V3 DTO]
+    </div>
+    <ul class="notes">
+      <li>Single endpoint throws on first failure; bulk allows partial success.</li>
+    </ul>
+  </article>
+
+  <article id="v3-get">
+    <span class="pill">GET</span><span class="pill">WorkLocationAssignmentV3Controller</span>
+    <h2>V3 list assignments</h2>
+    <p class="path">GET /v3/company/{account_id}/policies/work_locations/employee_assignments</p>
+    <div class="mermaid">
+flowchart TD
+  A[GET V3 assignments] --> B{Sync in progress?}
+  B -->|yes| C[307]
+  B -->|no| D[Parse employeeIds + isPrimary]
+  D --> E{Distributed cache FF?}
+  E -->|on| F[Cached load]
+  E -->|off| G{isPrimary == true?}
+  F --> G
+  G -->|true| H[V2 primary assignment query]
+  G -->|false or null| I[Query primary + additional tables]
+  H --> Z[List V3 DTO]
+  I --> Z
+    </div>
+    <ul class="notes">
+      <li>isPrimary=true remaps V2 primary assignments to QBO ids. Null includes both types.</li>
+    </ul>
+  </article>
+
+  <article id="v3-employees">
+    <span class="pill">GET</span><span class="pill">WorkLocationAssignmentV3Controller</span>
+    <h2>Employees by work location filter</h2>
+    <p class="path">GET /v3/company/{account_id}/policies/work_locations/employee_assignments/employees</p>
+    <div class="mermaid">
+flowchart TD
+  A[GET employeesFilter JSON] --> B[EmployeesFilterParser]
+  B --> C[API id to internal WL id]
+  C --> D{WL exists for company?}
+  D -->|no| E["employees=[], totalCount=0"]
+  D -->|yes| F[Collect assigned QBO employees]
+  F --> G{Exclusion filter?}
+  G -->|ne / notIn| H[Complement vs all mapped EEs]
+  G -->|eq / in| I[Keep mapped QBO ids + isPrimary]
+  H --> Z[EmployeesByWorkLocationDataModel]
+  I --> Z
+    </div>
+    <ul class="notes">
+      <li>workLocation.id supports eq/ne/in/notIn (in/notIn limited to 1 item). assignmentType: PRIMARY | ADDITIONAL | BOTH.</li>
+      <li>Exclusion results set isPrimary to null. Unmapped QBO ids are dropped.</li>
+    </ul>
+  </article>
+
+  <footer>
+    Source: WorkLocationController, CompanyPrimaryWorkLocationController, EmployeeWorkLocationAssignmentController,
+    WorkLocationAssignmentV3Controller and their service / sync-workflow / IOPV2 implementations in policies-web-services.
+    HTTP envelope is Result. Published from idea-brain-storm GitHub Pages (main /docs).
+  </footer>
+</body>
+</html>
